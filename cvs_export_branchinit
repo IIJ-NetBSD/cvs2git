@@ -1,0 +1,149 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+my $dstdir = ".";
+
+sub usage {
+	die "usage: cvs_co_branchinit cvsworkdir branch branchinfo\n";
+}
+
+usage() unless ($#ARGV == 2);
+
+my $cvstmpdir = shift;
+my $branch = shift;
+my $branchinfo = shift || "work.import/branchinfo";
+
+unless (-d "$cvstmpdir/CVS") {
+	die "$cvstmpdir is not CVS work directory\n";
+}
+unless (-f $branchinfo) {
+	die "$branchinfo is exists\n";
+}
+
+open(CVSROOT, "$cvstmpdir/CVS/Root") or die "open: $cvstmpdir/CVS/Root: $!\n";
+chop(my $cvsroot = <CVSROOT>);
+close(CVSROOT);
+open(CVSREPOS, "$cvstmpdir/CVS/Repository") or die "open: $cvstmpdir/CVS/Repository: $!\n";
+chop($_ = <CVSREPOS>);
+close(CVSREPOS);
+$cvsroot = "$cvsroot/$_";
+
+
+my @checkout;
+
+open(BRANCHINFO, $branchinfo) or die "open: $branchinfo: $!\n";
+while (<BRANCHINFO>) {
+	chop;
+
+#	print STDERR ".";
+
+	my $obj;
+
+	my @elm = split(/\t/, $_);
+	for (@elm) {
+		my ($key, $value) = split(/:/, $_, 2);
+		$obj->{$key} = $value;
+	}
+	for (@elm) {
+		my ($key, $value) = split(/:/, $_, 2);
+		if (($key eq 'branchto') && ($value =~ m/^\Q$branch\E,/)) {
+
+#			print STDERR "#";
+
+			my $path = $obj->{path};
+			my $file = $obj->{file};
+			my $rev = $obj->{revision};
+			my $state = $obj->{state};
+
+			push(@checkout, {
+				'path' => $path,
+				'file' => $file,
+				'revision' => $rev,
+				'state' => $state
+			});
+		}
+	}
+}
+close(BRANCHINFO);
+#print STDERR "\n";
+
+
+for (@checkout) {
+	my $file = $_->{file};
+	my $path = $_->{path};
+	my $rev = $_->{revision};
+	my $state = $_->{state};
+
+	if ($state ne 'dead') {
+		my $mode = (stat("$cvsroot/$file"))[2];
+		$mode |= 0600;
+		$mode |= ($mode & 0700) >> 3;
+		$mode |= ($mode & 0700) >> 6;
+		$mode &= 0755;
+		my $body = cvs_get($cvstmpdir, $path, $rev);
+		printf "%s\@%s\n", $path, $rev;
+		putfile("$dstdir/$path", $mode, $body);
+	}
+}
+
+
+sub putfile {
+	my ($path, $mode, $body) = @_;
+
+	(my $dir = $path) =~ s,/[^/]*$,,;
+
+	force_mkdir($dir);
+
+	printf STDERR "%s %d bytes\n", $path, length($body);
+
+	open my $file, ">", $path or die "open: $path: $!\n";
+	print $file $body;
+	chmod $mode, $file;
+	close($file);
+}
+
+# like "mkdir -p"
+BEGIN {
+	my $lastmkdir;
+
+	sub force_mkdir {
+		my $dir = shift;
+
+		if (defined($lastmkdir) && ($lastmkdir eq $dir)) {
+			return;
+		}
+		$lastmkdir = $dir;
+
+		my @dirs;
+		while (($dir ne '') && !(-d $dir)) {
+			unshift(@dirs, $dir);
+			$dir =~ s,/?[^/]*$,,;
+		}
+
+		for (@dirs) {
+			print STDERR "mkdir $_\n";
+			mkdir($_, 0777);
+		}
+	}
+}
+
+sub cvs_get {
+	my $cvsdir = shift;
+	my $path = shift;
+	my $revision = shift;
+
+	open my $cvs, "-|" or do {
+		chdir $cvsdir;
+		exec('cvs', '-q', 'update', '-p', "-r$revision", $path);
+		exit 1;
+	};
+	local $/;
+	undef $/;
+	my $body = <$cvs>;
+	close($cvs);
+
+	$body;
+}
+

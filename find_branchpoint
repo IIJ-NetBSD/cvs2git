@@ -1,0 +1,226 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Getopt::Std;
+use JSON::XS;
+
+sub usage {
+	die <<__USAGE__;
+usage: find_branchpoint <jslog> <branchlog> <tag or branch> [<from branch>]
+	-q	quiet
+	-l	output result list
+	-T	dump only tagged file (don't search)
+	-D	dump matching point (DEBUG)
+	-X	more debug
+__USAGE__
+}
+
+my %opts;
+getopts('DlqTX', \%opts) or usage();
+usage() if (($#ARGV != 2) && ($#ARGV != 3));
+
+my $jslog = shift;
+my $branchlog = shift;
+my $tag = shift;
+my $filterbranch = shift;
+
+my %tagged;
+my %tagged_from_branch;
+my $nfiles = 0;
+
+
+open(BRANCHLOG, $branchlog) or die "open: $branchlog: $!\n";
+while (<BRANCHLOG>) {
+	chop;
+
+	my $match = 0;
+	my %record;
+	my @elm = split(/\t/, $_);
+	for (@elm) {
+		my ($key, $value) = split(/:/, $_, 2);
+		$record{$key} = $value;
+
+		if (($key eq 'tag') && ($value eq $tag)) {
+			$match = 1;
+			$nfiles++;
+			print STDERR "found $nfiles files tagged $tag    \r";
+		}
+		if (($key eq 'branchto') && ($value =~ m/^\Q${tag}\E,/)) {
+			$match = 1;
+			$nfiles++;
+			print STDERR "found $nfiles files branchto $tag  \r";
+		}
+	}
+
+	if ($record{state} eq 'dead') {
+		$match = 0;
+	}
+
+	if ($match) {
+		$tagged{$record{path}} = $record{revision};
+		$tagged_from_branch{$record{branch}}++;
+	}
+}
+close(BRANCHLOG);
+print STDERR "\n";
+
+unless (defined($filterbranch)) {
+	for (sort { $tagged_from_branch{$a} <=> $tagged_from_branch{$b} } keys(%tagged_from_branch)) {
+		printf "%d files has tag %s from branch %s\n", $tagged_from_branch{$_}, $tag, $_;
+		$filterbranch = $_;
+	}
+}
+
+print "pickup from branch <$filterbranch>\n";
+
+if ($opts{T}) {
+	for (keys(%tagged)) {
+		printf "%s\@%s\n", $_, $tagged{$_};
+	}
+	exit;
+}
+print STDERR "found $nfiles files $tag\n";
+
+my $taggedfile = keys(%tagged);
+
+my $found_time = find_branchpoint();
+if ($opts{l}) {
+	find_branchpoint($found_time);
+}
+exit;
+
+
+sub find_branchpoint {
+	my $dumppoint = shift;
+
+	my %matched;
+	my $match = 0;
+
+	my %candidate_matched;
+	my $candidate = 0;
+	my $candidate_time_start;
+	my $candidate_time;
+
+	my $commitstate;
+	open(JSLOG, $jslog) or die "open: $jslog: $!\n";
+	while (<JSLOG>) {
+		my $obj = decode_json($_);
+
+		next if ($obj->{branch} ne $filterbranch);
+
+		my $unixtime_start = $obj->{unixtime_start};
+		my $unixtime = $obj->{unixtime};
+		my $log = $commitstate->{log} = $obj->{log};
+		for my $fileobj (@{$obj->{files}}) {
+			my $path = $fileobj->{path};
+			my $revision = $fileobj->{revision};
+
+			if ($fileobj->{state} eq 'dead') {
+				delete $commitstate->{files}->{$path};
+
+				if ($matched{$path}) {
+					delete $matched{$path};
+					$match--;
+				}
+
+			} else {
+				$commitstate->{files}->{$path} = $revision;
+
+				if (exists($tagged{$path})) {
+					if ($tagged{$path} eq $revision) {
+						if ($opts{X}) {
+							print "$path $tagged{$path} tagged / commit $revision MATCH!\n";
+						}
+						$matched{$path} = $revision;
+						$match++;
+					} else {
+						if ($opts{X}) {
+							print "$path $tagged{$path} tagged / commit $revision not matchs\n";
+						}
+						if ($matched{$path}) {
+							delete $matched{$path};
+							$match--;
+						}
+					}
+				} else {
+					if ($opts{X}) {
+						print "$path $revision not tagged. ignore\n";
+					}
+				}
+			}
+		}
+
+		if ($match >= $candidate) {
+			if ($match > $candidate) {
+				$candidate_time_start = $unixtime;
+			}
+			$candidate = $match;
+			$candidate_time = $unixtime_start;
+			if ($dumppoint && ($unixtime == $dumppoint)) {
+				%candidate_matched = %matched;
+			}
+		}
+
+		if ($opts{D}) {
+			printf "%s-%s	%d	%d/%d	%9.5f%% (%d commit)\n", timestamp($unixtime_start), timestamp($unixtime), $unixtime, $match, $taggedfile, $match * 100.0 / $taggedfile, $#{$obj->{files}};
+		}
+	}
+	close(JSLOG);
+
+	if ($dumppoint) {
+		my %unseen = %tagged;
+		for (keys(%candidate_matched)) {
+			if ($unseen{$_} ne $candidate_matched{$_}) {
+				printf "ERROR: %s tagged:%s  matched:%s\n", $_, $unseen{$_}, $candidate_matched{$_};
+			}
+			delete $unseen{$_};
+#			printf "RESULT EXIST: %s\@%s\n", $_, $candidate_matched{$_};
+		}
+		for (keys(%unseen)) {
+			printf "RESULT  LACK: %s\@%s\n", $_, $unseen{$_};
+		}
+
+	} else {
+		printf
+		    "<%s> tag match %d/%d files (%9.5f%%) on branch <%s>, " .
+		    "%d files is not match\n from %d %s\n to   %d %s\n",
+		    $tag,
+		    $candidate, $taggedfile,
+		    $candidate * 100.0 / $taggedfile,
+		    $filterbranch,
+		    $taggedfile - $candidate,
+		    $candidate_time_start, timestamp($candidate_time_start),
+		    $candidate_time, timestamp($candidate_time);
+	}
+
+	$candidate_time;
+}
+
+sub timestamp {
+	my $t = shift;
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = gmtime($t);
+
+	sprintf("%04d-%02d-%02d %02d:%02d:%02d +0000", $year + 1900, $mon + 1, $mday, $hour, $min, $sec);
+}
+
+sub rev2cmpstr {
+	my $rev = shift;
+
+	my @rev = split(/\./, $rev);
+	join(".", map { sprintf("%07d", $_) } @rev);
+}
+
+sub revision_cmp {
+	my ($rev1, $rev2) = @_;
+
+	rev2cmpstr($rev1) cmp rev2cmpstr($rev2);
+}
+
+# XXX
+sub is_import_revision {
+	my $rev = shift;
+	($rev =~ m/^1\.1\.\d+\.\d+$/)
+}
+

@@ -1,0 +1,154 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Compare;
+use File::Slurp;
+
+$| = 1;
+
+sub usage {
+	die <<__USAGE__;
+usage: compare_dir [-X] <cvsdir> <gitdir>
+	-x	ignore CVS keyword Attic
+	-X	force fix CVS keyword Attic
+__USAGE__
+}
+
+my %ignoredir = (
+	'.' => 1,
+	'..' => 1,
+	'.git' => 1,
+	'CVS' => 1,
+);
+
+
+my %opts;
+getopts('xX', \%opts) or usage();
+
+usage() if ($#ARGV != 1);
+
+my $dir1 = shift;
+my $dir2 = shift;
+
+my @list1 = sort(files($dir1));
+my @list2 = sort(files($dir2));
+
+if ($#list1 != $#list2) {
+	print "number of file different $dir1/ and $dir2/\n";
+	exit 1;
+}
+
+my $anyerror = 0;
+for (0 .. $#list1) {
+	(my $file1 = $list1[$_]) =~ s,^[^/]*/+,,;
+	(my $file2 = $list2[$_]) =~ s,^[^/]*/+,,;
+
+	if ($file1 ne $file2) {
+		print "filename list is different\n";
+		$anyerror++;
+		last;
+	}
+}
+exit 1 if ($anyerror);
+
+for (0 .. $#list1) {
+	if (compare($list1[$_], $list2[$_]) != 0) {
+		if (!$opts{x} || (compare_ignore_cvskeyword($list1[$_], $list2[$_]) != 0)) {
+			print "diff -au $list1[$_] $list2[$_]\n";
+			$anyerror++;
+		}
+
+		if ($opts{X}) {
+			fix_cvskey_hack($list1[$_]);
+		}
+
+	}
+}
+exit 1 if ($anyerror);
+exit 0;
+
+
+sub compare_ignore_cvskeyword {
+	my $file1 = shift;
+	my $file2 = shift;
+
+	my @file1 = read_file($file1);
+	my @file2 = read_file($file2);
+
+	if ($#file1 != $#file2) {
+		return -1;
+	}
+
+	for (0 .. $#file1) {
+		if ($file1[$_] ne $file2[$_]) {
+			my $tmp1 = cvskeyword_attic_delete($file1[$_]);
+			my $tmp2 = cvskeyword_attic_delete($file2[$_]);
+
+			if ($tmp1 ne $tmp2) {
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+sub cvskeyword_attic_delete {
+	my $line = shift;
+
+	$line =~ s,(\$(?:Source|Header):[^\$]*?)/Attic/([^\$]*)\$,$1/$2\$,;
+	$line;
+}
+
+sub fix_cvskey_hack {
+	local $_;
+
+	my $file = shift;
+	open(my $fh, '<', $file) or die "open: $file: $!\n";
+	my @lines = <$fh>;
+	close($fh);
+
+	my $nreplace = 0;
+	for (@lines) {
+		my $old = $_;
+		$_ = cvskeyword_attic_delete($old);
+		if ($old ne $_) {
+			print STDERR "fix OLD: $old";
+			print STDERR "    NEW: $_";
+			$nreplace++;
+		}
+	}
+
+	if ($nreplace) {
+		open(my $fh, '>', $file) or die "open: $file: $!\n";
+		print $fh @lines;
+		close($fh);
+	}
+
+	1;
+}
+
+
+sub files {
+	my $dir = shift;
+
+	opendir(DIR, $dir);
+	my @node = readdir(DIR);
+	closedir(DIR);
+
+	my @files;
+	for (@node) {
+		if (-d "$dir/$_") {
+			exists($ignoredir{$_}) && next;
+
+			push(@files, files("$dir/$_"));
+		} elsif ( -f "$dir/$_" ) {
+			push(@files, "$dir/$_");
+		} else {
+			warn "UNKNOWN: unknown file type: $dir/$_\n";
+		}
+	}
+	@files;
+}

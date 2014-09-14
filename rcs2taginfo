@@ -1,0 +1,235 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Time::Local;
+use Data::Dumper;
+use JSON::XS;
+use Time::Local;
+
+my $BRANCH_1_IS_BRANCH = 0;
+
+$ENV{LANG} = "C";
+my $RLOG = "rlog";
+my $REVISION_RE = qr/(?:\d+\.)*\d+/;
+
+for my $file (@ARGV) {
+	print STDERR "$file\n";
+
+	my $obj = rcs2tagjs($file);
+	for (sort { rev2sortkey($a) cmp rev2sortkey($b) } keys(%$obj)) {
+		print "file:$file";
+		printf "	path:%s",attic2path($file);
+		print "	revision:$_";
+
+		for (@{$obj->{$_}->{branch}}) {
+			print "	branch:$_";
+		}
+
+		for (@{$obj->{$_}->{tag}}) {
+			print "	tag:$_";
+		}
+		for (@{$obj->{$_}->{branchto}}) {
+			print "	branchto:$_";
+		}
+		print "	state:$obj->{$_}->{state}";
+		print "	author:$obj->{$_}->{author}";
+		print "	unixtime:$obj->{$_}->{unixtime}";
+		print "\n";
+	}
+
+#	print Dumper($obj);
+#	print STDERR "$file done\n";
+}
+exit;
+
+
+sub rcs2tagjs {
+	my $file = shift;
+	my $obj;
+	my $topbranch = '#trunk';
+
+	my $info = rcs_extract($file);
+
+	my @revisions = @{$info->{revisions}};
+	my %existrevision;
+	my %revision2tags = %{$info->{tags}};
+
+	for (@revisions) {
+		$existrevision{$_} = 1;
+	}
+
+#die Dumper($info);
+	if ($BRANCH_1_IS_BRANCH && exists($revision2tags{'1'})) {
+		$topbranch = ${$revision2tags{'1'}}[0];
+	}
+
+#print Dumper($info);
+
+	for my $rev (keys(%revision2tags)) {
+		my $r;
+
+		if (is_tag($rev)) {
+			$r = $rev;
+
+			unless (exists $existrevision{$r}) {
+				warn "$file: $r (", join(",", @{$revision2tags{$r}}), ") is not exists\n";
+				next;
+			}
+
+			push(@{$obj->{$r}->{tag}}, @{$revision2tags{$rev}});
+		} else {
+			$r = branch2baserevision($rev);
+			if ($r eq '') {
+				next;
+			}
+
+			unless (exists $existrevision{$r}) {
+				warn "$file: $r (", join(",", @{$revision2tags{$r}}), ") is not exists\n";
+				next;
+			}
+
+			push(@{$obj->{$r}->{branchto}}, join(",", @{$revision2tags{$rev}}, $rev));
+		}
+
+		$obj->{$r}->{unixtime} = $info->{unixtime}->{$r};
+		$obj->{$r}->{author} = $info->{author}->{$r};
+		$obj->{$r}->{state} = $info->{state}->{$r};
+		$obj->{$r}->{line} = $info->{line}->{$r};
+
+		# revision to tag
+		my @branch;
+		(my $branchrev = $r) =~ s/\.\d+$//;
+		if (exists($revision2tags{$branchrev})) {
+			push(@branch, @{$revision2tags{$branchrev}});
+		} elsif ($r =~ m/^1\.1\.1\.\d+$/) {
+#			push(@branch, $topbranch);
+			push(@branch, '#unknown2');
+		} elsif ($r =~ m/^\d+\.\d+$/) {
+			push(@branch, $topbranch);
+		} else {
+			push(@branch, '#unknown');
+		}
+
+		if (exists($info->{defaultbranch}) &&
+		    (substr($r, 0, length($info->{defaultbranch})) eq $info->{defaultbranch}) &&
+		    (substr($r, length($info->{defaultbranch})) =~ m/^\.\d+$/)) {
+			push(@branch, $topbranch);
+		}
+
+		if ($r =~ m/^1\.1\.1\.\d+$/) {
+			push(@branch, $topbranch);
+		}
+		@branch = uniq(sort { $a cmp $b } @branch);
+
+		$obj->{$r}->{branch} = \@branch;
+
+	}
+
+#print Dumper($obj);
+
+	$obj;
+}
+
+sub uniq {
+		my $prev = 'x' . $_[0];
+		grep { ($prev eq $_) ? 0 : ($prev = $_, 1) } @_;
+}
+
+sub rev2sortkey {
+	my $rev = shift;
+	join('.', map { sprintf("%08d", $_) } split(/\./, $rev))
+}
+
+sub branch2baserevision {
+	my $rev = shift;
+	my @rev = split(/\./, $rev);
+	pop(@rev);
+	join('.', @rev);
+}
+
+sub is_tag {
+	my $rev = shift;
+	my @rev = split(/\./, $rev);
+	($#rev & 1);
+}
+
+sub is_branch {
+	!is_tag(shift);
+}
+
+sub rcs_extract {
+	my $file = shift;
+
+	my $info;
+	my $currev;
+
+	$info->{tags} = {};
+
+	my $state = 'header';
+	my $header = '';
+	open(FILE, $file) or return undef;
+	while (<FILE>) {
+		if ($state eq 'header') {
+			$header .= $_;
+			if ($_ eq "\n") {
+				$state = 'revs';
+				next;
+			}
+			next;
+		}
+		if ($state eq 'revs') {
+			if (m/^($REVISION_RE)$/) {
+				push(@{$info->{revisions}}, $1);
+				$currev = $1;
+			}
+			if (m/^date\s+(\d+)\.(\d+)\.(\d+)\.(\d+)\.(\d+)\.(\d+);\s+author\s+([^;]+);\s+state\s+([^;]+);/) {
+#print "$currev -> $_\n";
+#				$info->{line}->{$currev} = $_;
+				$info->{unixtime}->{$currev} = timegm($6, $5, $4, $3, $2 - 1, $1 <= 1900 ? 1900 + $1 : $1);
+				$info->{author}->{$currev} = $7;
+				$info->{state}->{$currev} = $8;
+			}
+
+			last if (m/^desc$/);
+		}
+	}
+	close(FILE);
+
+	my @defs = split(/;/, $header);
+	for (@defs) {
+		s/^[\s\n]*//sg;
+		s/[\s\n]*$//sg;
+		my ($key, $value) = split(/[\s\n]+/, $_, 2);
+		$key = $_ unless (defined $key);
+		$value = '' unless (defined $value);
+		if ($key eq 'branch') {
+			$info->{defaultbranch} = $value;
+		}
+		if ($key eq 'symbols') {
+			my @tags = split(/[\s\n]+/, $value);
+			for (@tags) {
+				my ($tag, $rev) = split(/:/, $_, 2);
+				if ($BRANCH_1_IS_BRANCH || ($rev ne '1')) {
+					$rev =~ s/\.0\././g;
+					push(@{$info->{tags}->{$rev}}, $tag);
+				}
+			}
+		}
+	}
+
+#die Dumper($info);
+
+	$info;
+}
+
+sub attic2path {
+	my $file = shift;
+
+	my $path = $file;
+	$path =~ s,/Attic/,/,;
+	$path =~ s/,v$//;
+
+	$path;
+}
+

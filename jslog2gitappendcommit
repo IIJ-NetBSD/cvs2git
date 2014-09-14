@@ -1,0 +1,277 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Cwd 'abs_path';
+use Data::Dumper;
+use Getopt::Std;
+use JSON::XS;
+
+sub usage {
+	die <<__USAGE__;
+usage: jslog2gitappendcommit [options] <jslog> <branch> <gitdir> <cvs-checkoutdir>
+	-v		verbose
+	-n		dry run (don't commit)
+	-D		debug
+	-f		force ignore timestamp
+__USAGE__
+}
+
+my %opts;
+getopts('Dfnv', \%opts) or usage();
+
+usage() if ($#ARGV != 3);
+
+my $jslog = shift;
+my $branch = shift;
+my $gitdir = shift;
+my $cvswork = abs_path(shift);
+my $cvsroot = getcvsroot($cvswork);
+
+my $gitbranch = ($branch eq '#trunk') ? 'master' : $branch;
+
+$gitdir =~ s,/$,,;
+$gitdir =~ s,/\.git$,,;
+
+my @commit;
+my $gitinfo = getlastcommitinfo($gitdir, $gitbranch);
+
+if (!exists($gitinfo->{unixtime}) ||
+    !exists($gitinfo->{log}) ||
+    !exists($gitinfo->{author})) {
+	die "cannot get last commit info: $gitdir\n";
+}
+
+my $lastcommit_unixtime = $gitinfo->{unixtime};
+
+open(JSLOG, '<', $jslog) or die "open: $jslog: $!\n";
+while (<JSLOG>) {
+	my $obj = decode_json($_);
+
+	if (!exists($opts{f}) &&
+	    ($obj->{unixtime} < $lastcommit_unixtime)) {
+		die "input jslog include before head of GIT\n";
+	}
+	next if ($obj->{branch} ne $branch);
+	push(@commit, $obj);
+}
+close(JSLOG);
+
+my $ncommit = @commit;
+my $nfiles = 0;
+for (@commit) {
+	$nfiles += @{$_->{files}};
+}
+
+print "$ncommit commits, ";
+print "$nfiles files\n";
+
+$| = 1;
+
+chdir $gitdir or die "chdir: $gitdir: $!\n";
+
+git_do_checkout($gitbranch);
+
+for my $commitobj (@commit) {
+	git_do_commit($commitobj);
+}
+exit;
+
+
+
+sub git_do_checkout {
+	my $branch = shift;
+
+	print "\n";
+	print "---- exec git checkout ----\n";
+
+	unless ($opts{n}) {
+		git_checkout($branch);
+	}
+
+	print "\n";
+}
+
+sub git_do_commit {
+	my $commitobj = shift;
+
+	print "================================================================\n";
+	print scalar(gmtime($commitobj->{unixtime})), " +0000, ";
+	print "commit by ", $commitobj->{author}, "\n";
+	print "branch $commitobj->{branch}\n";
+	print "\n";
+	print $commitobj->{log};
+	print "\n";
+	print "FILES:\n";
+	for my $obj (@{$commitobj->{files}}) {
+		my $path = $obj->{path};
+		my $rev = $obj->{revision};
+
+		if ($obj->{state} eq 'dead') {
+			print "    deleted  $path\@$rev\n";
+			unless ($opts{n}) {
+				git_unlink($cvswork, $obj);
+			}
+		} elsif (-f "$path") {
+			print "    modified $path\@$rev\n";
+			unless ($opts{n}) {
+				git_modify($cvswork, $obj);
+			}
+		} else {
+			print "    added    $path\@$rev\n";
+			unless ($opts{n}) {
+				git_append($cvswork, $obj, $cvsroot);
+			}
+		}
+	}
+	print "\n";
+	print "---- exec git commit ----\n";
+
+	unless ($opts{n}) {
+		$ENV{'GIT_AUTHOR_DATE'} = gmtime($commitobj->{unixtime}) . " +0000";
+		$ENV{'GIT_COMMITTER_DATE'} = gmtime($commitobj->{unixtime}) . " +0000";
+		$ENV{'GIT_AUTHOR_NAME'} = $commitobj->{author};
+		$ENV{'GIT_AUTHOR_EMAIL'} = sprintf('%s@netbsd.org', $commitobj->{author});
+		$ENV{'GIT_COMMITTER_NAME'} = $commitobj->{author};
+		$ENV{'GIT_COMMITTER_EMAIL'} = sprintf('%s@netbsd.org', $commitobj->{author});
+
+		git_commit($commitobj->{log});
+	}
+
+	print "\n";
+}
+
+sub git_checkout {
+	my $branch = shift;
+	system('git', 'checkout', $branch);
+}
+
+sub git_commit {
+	my ($log) = @_;
+	system('git', 'commit', '-m', $log);
+}
+
+sub git_unlink {
+	my ($cvswork, $obj) = @_;
+	system('git', 'rm', $obj->{path});
+}
+
+sub git_modify {
+	my ($cvswork, $obj) = @_;
+
+	my $body = cvs_get($obj->{path}, $obj->{revision});
+	open my $file, ">", $obj->{path} or die "open: $obj->{path}: $!\n";
+	print $file $body;
+	close($file);
+
+	system('git', 'add', $obj->{path});
+}
+
+sub git_append {
+	my ($cvswork, $obj, $cvsroot) = @_;
+
+	(my $dir = $obj->{path}) =~ s,/[^/]*$,,;
+	force_mkdir($dir);
+
+
+	my $rcsfile = sprintf("%s/%s", $cvsroot, $obj->{file});
+	my $mode = (stat($rcsfile))[2];
+	$mode |= 0600;
+	$mode |= ($mode & 0700) >> 3;
+	$mode |= ($mode & 0700) >> 6;
+	$mode &= 0755;
+	my $body = cvs_get($obj->{path}, $obj->{revision});
+	open my $file, ">", $obj->{path} or die "open: $obj->{path}: $!\n";
+	print $file $body;
+	chmod $mode, $file;
+	close($file);
+
+	system('git', 'add', $obj->{path});
+}
+
+sub cvs_get {
+	my $path = shift;
+	my $revision = shift;
+
+	open my $cvs, "-|" or do {
+		chdir $cvswork;
+		exec('cvs', '-q', 'update', '-p', "-r$revision", $path);
+		exit 1;
+	};
+	local $/;
+	undef $/;
+	my $body = <$cvs>;
+	close($cvs);
+
+	$body;
+}
+
+# like "mkdir -p"
+sub force_mkdir {
+	my $dir = shift;
+	my @dirs;
+
+	while (($dir ne '') && !(-d $dir)) {
+		unshift(@dirs, $dir);
+		$dir =~ s,/?[^/]*$,,;
+	}
+
+	for (@dirs) {
+		mkdir($_, 0777);
+	}
+}
+
+sub getlastcommitinfo {
+	my $gitdir = shift;
+	my $branch = shift;
+
+	open my $git, "-|" or do {
+		exec('git', "--git-dir=$gitdir/.git", 'show', $branch, '--format=raw');
+		exit 1;
+	};
+
+	my $state = 'header';
+	my $obj;
+	while (<$git>) {
+		chop;
+
+		if ($state eq 'header') {
+			if ($_ eq "") {
+				$state = 'log';
+			} elsif (m/^commit ([\da-f]+)$/i) {
+				$obj->{hash} = $1;
+			} elsif (m/^author\s(.*?)\s<([^>]*)>\s(\d+)\s([\+\-]\d\d\d\d)$/) {
+				$obj->{author} = $1;
+				$obj->{mail} = $2;
+				$obj->{unixtime} = $3;
+				$obj->{tz} = $4;
+			}
+		} elsif ($state eq 'log') {
+			if (m/^diff /) {
+				$state = 'diff';
+				redo;
+			}
+			if (m/^    (.*)/) {
+				$obj->{log} .= $1 . "\n";
+			}
+		} elsif ($state eq 'diff') {
+			last;
+		}
+	}
+
+	close($git);
+
+	$obj;
+}
+
+sub getcvsroot {
+	my $cvswork = shift;
+
+	open(CVSROOT, "$cvswork/CVS/Root") or die "open: $cvswork/CVS/Root: $!\n";
+	chop(my $cvsroot = <CVSROOT>);
+	close(CVSROOT);
+	open(CVSREPOS, "$cvswork/CVS/Repository") or die "open: $cvswork/CVS/Repository: $!\n";
+	chop($_ = <CVSREPOS>);
+	close(CVSREPOS);
+	"$cvsroot/$_";
+}

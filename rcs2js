@@ -1,0 +1,289 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Time::Local;
+use Data::Dumper;
+use JSON::XS;
+
+my $BRANCH_1_IS_BRANCH = 0;
+
+$ENV{LANG} = "C";
+my $RLOG = "rlog";
+my $REVISION_RE = qr/(?:\d+\.)*\d+/;
+
+for (@ARGV) {
+	print STDERR $_, "\n";
+	rcs2log($_);
+}
+
+
+sub output_sub {
+	my $obj = shift;
+	my $branch = shift;
+
+	my @output;
+	push(@output, json_kv_output('unixtime', sprintf("%010d", $obj->{unixtime})));
+	push(@output, json_kv_output('branch', $branch));
+	push(@output, json_kv_output('author', $obj->{author}));
+	push(@output, json_kv_output('revision', $obj->{revision}));
+	push(@output, json_kv_output('path', $obj->{path}));
+	push(@output, json_kv_output('state', $obj->{state}));
+	push(@output, json_kv_output('file', $obj->{file}));
+	push(@output, json_kv_output('log', $obj->{log}));
+	print "{";
+	print join(",", @output);
+	print "}\n";
+}
+
+
+sub output {
+	my $obj = shift;
+
+	(my $log = $obj->{log}) =~ s/[\t\n]/ /sg;
+
+	if (exists($obj->{branchalias})) {
+		output_sub($obj, $obj->{branchalias});
+	}
+	for (@{$obj->{branch}}) {
+		output_sub($obj, $_);
+	}
+
+#	print encode_json($obj), "\n";
+}
+
+sub json_kv_output {
+	my $key = shift;
+	my $value = shift;
+	sprintf '"%s":"%s"', json_escape($key), json_escape($value);
+}
+
+
+sub json_escape {
+	my $str = shift;
+
+	$str =~ s/\\/\\\\/sg;
+	$str =~ s/"/\\"/sg;
+	$str =~ s/\t/\\t/sg;
+	$str =~ s/\n/\\n/sg;
+	$str =~ s/\r/\\r/sg;
+	$str =~ s/\f/\\f/sg;
+	$str =~ s/([\x00-\x1f\x7f-\xff])/sprintf('\\u%04x', unpack("C", $1))/seg;
+
+	$str;
+}
+
+
+sub rcs2log {
+	my $file = shift;
+
+	my $rcsinfo = rcs_extract($file);
+	my @revisions = @{$rcsinfo->{revisions}};
+	my %revision2tag = %{$rcsinfo->{tags}};
+#	rcs_revisions($file);
+#	my @revisions = rcs_revisions($file);
+#	my %revision2tag = rcs_tags($file);
+
+#die Dumper($rcsinfo);
+
+	my $import_to_main = 0;
+
+	if (exists($rcsinfo->{defaultbranch}) &&
+	    ($rcsinfo->{defaultbranch} =~ m/^1\.1\./)) {
+		$import_to_main = 1;
+	}
+
+	my $importbranch = exists($rcsinfo->{defaultbranch}) ? $rcsinfo->{defaultbranch} : '1.1.1';
+
+	if (!exists($rcsinfo->{unixtime}->{'1.1'}) &&
+	    (grep { m/^\Q$importbranch\E\./ } @{$rcsinfo->{revisions}})) {
+		die "$file: 1.1 is not exists, and import branch is exist\n";
+	}
+	if (exists($rcsinfo->{unixtime}->{$importbranch . '.2'}) &&
+	    !exists($rcsinfo->{unixtime}->{$importbranch . '.1'})) {
+		die "$file: $importbranch.1 has removed?!\n";
+		$import_to_main = 1;
+	}
+
+	if (exists($rcsinfo->{unixtime}->{$importbranch . '.1'}) &&
+	    ($rcsinfo->{unixtime}->{'1.1'} == $rcsinfo->{unixtime}->{$importbranch . '.1'})) {
+		$import_to_main = 1;
+	}
+
+	for my $rev (sort {
+	        (sprintf("%10d", $rcsinfo->{unixtime}->{$a}) . "." . $a) cmp
+	        (sprintf("%10d", $rcsinfo->{unixtime}->{$b}) . "." . $b)
+	    } keys(%{$rcsinfo->{unixtime}})) {
+
+		my $obj;
+
+		if ($import_to_main &&
+		    exists($rcsinfo->{unixtime}->{'1.1'}) &&
+		    exists($rcsinfo->{unixtime}->{$importbranch . '.1'}) &&
+		    ($rev eq '1.1')) {
+			next;
+		}
+
+
+		$obj->{file} = $file;
+		$obj->{path} = attic2path($file);
+		$obj->{revision} = $rev;
+
+		$obj->{branch} = revision2branchname($file, $rev, \%revision2tag);
+
+		# from import to maintrunk?
+		if ($import_to_main) {
+			if (($rev =~ m/^\d+\.\d+$/) && ($rev ne '1.1')) {
+				# import branch has override by maintrunk
+				$import_to_main = 0;
+			} elsif ($rev =~ m/^\Q$importbranch\E\.\d+$/) {
+				$obj->{branchalias} = '#trunk';
+			}
+		}
+
+		open(RLOG, '-|') or do {
+			exec($RLOG, '-z+00:00', '-N', "-r$rev", $file);
+			exit(1);
+		};
+
+		my $leading_ok = 0;
+		my $log;
+		while (<RLOG>) {
+			chop;
+			if (m/^revision\s+\Q$rev\E/) {
+				$log = '';
+				last;
+			}
+		}
+		if ($?) {
+			die "exit with ", $? >> 8;
+		}
+		die "$file: no log leading line: $RLOG -z+00:00 -N -r$rev $file\n" unless (defined $log);
+
+		my $info = <RLOG>;
+		unless ($info =~ m/^date:\s+(\d\d\d\d)\-(\d\d)\-(\d\d)\s+(\d\d):(\d\d):(\d\d)\+00;\s+author:\s+([^\s]+);\s+state:\s+([^\s]+);/) {
+			die "$file: illegal info: $info\n";
+		}
+		$obj->{unixtime} = timegm($6, $5, $4, $3, $2 - 1, $1 - 1900);
+		$obj->{author} = $7;
+		$obj->{state} = $8;
+
+		my $tmp = <RLOG>;
+		if ($tmp =~ m/^branches:\s+($REVISION_RE);/) {
+#			$obj->{branch} = $1;
+#			$obj->{branchname} = revision2branchname($file, $1, \%revision2tag);
+		} else {
+			$log = $tmp;
+		}
+
+		while (<RLOG>) {
+			$log .= $_;
+		}
+		$log =~ s/\n=============================================================================\n$/\n/s;
+
+		close(RLOG);
+
+		$obj->{log} = $log;
+
+		output($obj);
+	}
+}
+
+sub rcs_extract {
+	my $file = shift;
+
+	my $info;
+
+	my @revisions;
+
+	my $state = 'header';
+	my $header = '';
+
+	my $currev;
+	open(FILE, $file) or do {
+		die "$file: $!\n";
+		return undef;
+	};
+	while (<FILE>) {
+		if ($state eq 'header') {
+			$header .= $_;
+			if ($_ eq "\n") {
+				$state = 'revs';
+				next;
+			}
+			next;
+		}
+
+		if ($state eq 'revs') {
+			if (m/^($REVISION_RE)$/) {
+				push(@{$info->{revisions}}, $1);
+				$currev = $1;
+			}
+
+			if (m/^date\s+(\d+)\.(\d+)\.(\d+)\.(\d+)\.(\d+)\.(\d+);\s+author\s+([^;]+);\s+state\s+([^;]+);/) {
+				$info->{line}->{$currev} = $_;
+				$info->{unixtime}->{$currev} = timegm($6, $5, $4, $3, $2 - 1, $1 <= 1900 ? 1900 + $1 : $1);
+				$info->{author}->{$currev} = $7;
+				$info->{state}->{$currev} = $8;
+			}
+
+			last if (m/^desc$/);
+		}
+	}
+	close(FILE);
+
+	my @defs = split(/;/, $header);
+	for (@defs) {
+		s/^[\s\n]*//sg;
+		s/[\s\n]*$//sg;
+		my ($key, $value) = split(/[\s\n]+/, $_, 2);
+		$key = $_ unless (defined $key);
+		$value = '' unless (defined $value);
+		if ($key eq 'branch') {
+			$info->{defaultbranch} = $value;
+		}
+		if ($key eq 'symbols') {
+			my @tags = split(/[\s\n]+/, $value);
+			for (@tags) {
+				my ($tag, $rev) = split(/:/, $_, 2);
+				if ($BRANCH_1_IS_BRANCH || ($rev ne '1')) {
+					$rev =~ s/\.0\././g;
+					push(@{$info->{tags}->{$rev}}, $tag);
+				}
+			}
+		}
+	}
+	$info->{tags} = {} unless (exists $info->{tags});
+
+	$info;
+}
+
+sub revision2branchname {
+	my $file = shift;
+	my $revision = shift;
+	my $r2t = shift;
+
+#print Dumper($r2t);
+
+	(my $branchrev = $revision) =~ s/\.\d+$//;
+	if (exists($r2t->{$branchrev})) {
+		$r2t->{$branchrev};
+	} else {
+		if ($revision =~ m/^\d+\.\d+$/) {
+			[ "#trunk" ];
+		} else {
+			[ "#unknown" ];
+		}
+	}
+}
+
+sub attic2path {
+	my $file = shift;
+
+	my $path = $file;
+	$path =~ s,/Attic/,/,;
+	$path =~ s/,v$//;
+
+	$path;
+}
+

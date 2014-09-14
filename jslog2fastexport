@@ -1,0 +1,278 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use JSON::XS;
+
+my $DEBUG = 0;
+my $DEBUG_MARK = 0;
+my $DEBUG_COMMIT = 1;
+
+sub usage {
+	die "usage: jslog2fastexport repository-path cvscheckout-path commit.jslog\n";
+}
+
+usage() unless ($#ARGV == 2);
+
+my $cvsdir = shift;
+my $cvswork = shift;
+usage() unless (-d $cvsdir);
+usage() unless (-d $cvswork);
+
+my $branch_mark;
+
+
+print "reset refs/heads/master\n";
+while (<>) {
+	my $obj = decode_json($_);
+
+	if ($obj->{branch} eq '#trunk') {
+		$obj->{branch} = 'master';
+	}
+
+	$obj->{mark} = fastexport($obj);
+	revision2mark_set($obj);
+}
+
+BEGIN {
+	my $revision2mark;
+	my $revision2branch;
+
+	#
+	# <file,revision> のキーから、そのcommitのmarkをset/get
+	# <file,revision> のキーから、そのcommitのbranchをset/get
+	#
+	sub revision2mark_set {
+		my $obj = shift;
+		my $mark = $obj->{mark};
+		my $branch = $obj->{branch};
+
+		for my $fileobj (@{$obj->{files}}) {
+			my $filekey = sprintf("%s - %s", $fileobj->{path}, $fileobj->{revision});
+			$revision2mark->{$filekey} = $mark;
+			$revision2branch->{$filekey} = $branch;
+		}
+	}
+
+	sub previous_revision {
+		my $rev = shift;
+		my @rev = split(/\./, $rev);
+
+		if ($rev[-1] eq '1') {
+			# "x.1" is not branch
+			if ($#rev == 1) {
+				return undef;
+			}
+			# 1.100.1.1 -> 1.100
+			pop(@rev);
+			pop(@rev);
+
+			if (join(".", @rev) eq '1.1.1.1') {
+				@rev = (1,1);
+			}
+		} else {
+			$rev[-1]--;
+		}
+		join(".", @rev);
+	}
+
+	#
+	# ファイルの *1つ前の* revisionが属するcommit(mark)を得る
+	#
+	sub revision2mark_from {
+		my $fileobj = shift;
+		my $rev = $fileobj->{revision};
+		my $prev = previous_revision($rev);
+
+		if (defined($prev)) {
+			my $filekey = sprintf("%s - %s", $fileobj->{path}, $prev);
+			$revision2mark->{$filekey};
+		} else {
+			return undef;
+		}
+	}
+
+	sub revision2branch_from {
+		my $fileobj = shift;
+		my $rev = $fileobj->{revision};
+		my $prev = previous_revision($rev);
+
+		if (defined($prev)) {
+			my $filekey = sprintf("%s - %s", $fileobj->{path}, $prev);
+			$revision2branch->{$filekey};
+		} else {
+			return undef;
+		}
+	}
+}
+
+# search where commit from
+sub getchangeset_src {
+	my $obj = shift;
+
+	my $mark_candidate;
+	my $branch_candidate;	# for strict check
+	for my $fileobj (@{$obj->{files}}) {
+		my $mark = revision2mark_from($fileobj);
+		my $branch = revision2branch_from($fileobj);
+
+		unless (defined $branch_candidate) {
+			$branch_candidate = $branch;
+		}
+
+		if ($DEBUG_MARK) {
+			printf STDERR "DEBUG: file:%s rev:%s -> from mark :%s (branch %s)\n",
+			    $fileobj->{path},
+			    $fileobj->{revision},
+			    defined $mark ? $mark : "NONE",
+			    defined($branch) ? $branch : "???";
+		}
+
+		if (defined($branch) && ($branch_candidate ne $branch)) {
+			$branch_candidate = $branch;
+		}
+
+		if (defined($branch) && ($branch_candidate ne $branch)) {
+			print STDERR "ERROR: branch $obj->{branch} from multi branches (from $branch)\n";
+			print STDERR Dumper($fileobj);
+		}
+
+		$mark_candidate = $mark;
+	}
+
+	printf STDERR "DEBUG: branch %s from %s\n", $obj->{branch}, defined $branch_candidate ? $branch_candidate : "UNKNOWN";
+
+
+	if ($DEBUG_MARK) {
+		printf STDERR "MARK FROM %s\n", defined $mark_candidate ? $mark_candidate : "NONE";
+	}
+
+
+	$mark_candidate;
+}
+
+
+
+
+sub fastexport {
+	my $obj = shift;
+
+	my @files = @{$obj->{files}};
+	for my $file (@files) {
+		if ($file->{state} ne 'dead') {
+			$file->{mark} = blob($file);
+		}
+	}
+	commit($obj);
+}
+
+BEGIN {
+	my $N = 1;
+
+	sub commit {
+		my $obj = shift;
+
+		my $mark = $N++;
+
+		$obj->{mark} = $mark;
+		my $author = sprintf('%s <%s@netbsd.org>', $obj->{author}, $obj->{author});
+
+		if ($DEBUG_COMMIT) {
+			printf STDERR "===== %s: commit (%s) mark %d, %d files by %s =====\n",
+			    scalar(localtime($obj->{unixtime})),
+			    $obj->{branch},
+			    $obj->{mark},
+			    $#{$obj->{files}} + 1,
+			    $author;
+		}
+
+		my $log = $obj->{log};
+		(my $unixtime = $obj->{unixtime}) =~ s/^0+//;
+
+		print "commit refs/heads/$obj->{branch}\n";
+		print "mark :$mark\n";
+		print "author $author $unixtime +0000\n";
+		print "committer $author $unixtime +0000\n";
+		print "data ", length($log), "\n";
+		print $log;
+
+		# new branch?
+		unless (exists $branch_mark->{$obj->{branch}}) {
+			# commit to new branch
+			my $commit_from = getchangeset_src($obj);
+			if (defined $commit_from) {
+				print "from :$commit_from\n";
+			}
+		} else {
+			# commit to existing branch
+			print "from :$branch_mark->{$obj->{branch}}\n";
+		}
+
+		$branch_mark->{$obj->{branch}} = $mark;
+
+		my @files = @{$obj->{files}};
+		for my $file (@files) {
+			(my $path = $file->{path}) =~ s,^\./,,;
+			if ($file->{state} eq 'dead') {
+				print "D $path\n";
+			} else {
+				my $mode = getfilemode_cvs($file->{file});
+				$mode &= 0700;
+				$mode |= 0200;
+				$mode |= ($mode & 0700) >> 3;
+				$mode |= ($mode & 0700) >> 6;
+				$mode &= 0755;
+				print "M 100", sprintf("%03o", $mode), " :$file->{mark} $path\n";
+			}
+		}
+		print "\n";
+
+		$mark;
+	}
+
+	sub blob {
+		my $file = shift;
+
+		my $mark = $N++;
+		my $body = getcvsfile($file->{path}, $file->{revision});
+
+		print "blob\n";
+		print "mark :$mark\n";
+		print "data ", length($body), "\n";
+		print $body, "\n";
+
+		$mark;
+	}
+}
+
+sub getfilemode_cvs {
+	my $file = shift;
+	(stat(join("/", $cvsdir, $file)))[2];
+}
+
+
+sub getcvsfile {
+	my $path = shift;
+	my $revision = shift;
+
+	if ($DEBUG) {
+		return "`cvs update -p -r$revision $cvswork/$path`\n";
+	}
+
+	local $/;
+	undef $/;
+	open(RCS, '-|') or do {
+		chdir $cvswork;
+		exec('cvs', '-q', 'update', '-p', "-r$revision", $path);
+		exit(1);
+	};
+	my $body = <RCS>;
+
+	if ($?) {
+		die "exit with ", $? >> 8;
+	}
+
+	close(RCS);
+	$body;
+}

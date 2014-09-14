@@ -1,0 +1,140 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Getopt::Std;
+use JSON::XS;
+
+sub usage {
+	die <<__USAGE__;
+usage: js2jslog [-t unixtime] [-d outputdir] jslog
+__USAGE__
+}
+
+my %opts;
+getopts('d:t:', \%opts) or usage();
+
+my $branchinfo;
+
+init_output();
+while (<>) {
+	my $obj = decode_json($_);
+
+	my $branch = $obj->{branch};
+	my $log = $obj->{log};
+	my $author = $obj->{author};
+	my $unixtime = $obj->{unixtime};
+	my $path = $obj->{path};
+	my $revision = $obj->{revision};
+
+	if (exists($opts{t}) && ($unixtime < $opts{t})) {
+		next;
+	}
+
+	# continuous commit?
+	if (exists($branchinfo->{$branch}) && (
+	    exists($branchinfo->{$branch}->{files}->{$path}) ||
+	    ($log ne $branchinfo->{$branch}->{log}) ||
+	    ($author ne $branchinfo->{$branch}->{author}) ||
+	    (($unixtime - $branchinfo->{$branch}->{unixtime}) > 300))) {
+
+		flushcommit(@{$branchinfo->{$branch}->{commit}});
+		delete($branchinfo->{$branch}->{commit});
+		delete $branchinfo->{$branch}->{files};
+	}
+	$branchinfo->{$branch}->{author} = $author;
+	$branchinfo->{$branch}->{log} = $log;
+	$branchinfo->{$branch}->{files}->{$path} = $revision;
+	$branchinfo->{$branch}->{unixtime} = $unixtime;
+	push(@{$branchinfo->{$branch}->{commit}}, $obj);
+}
+for my $branch (keys(%$branchinfo)) {
+	if (exists($branchinfo->{$branch}->{commit})) {
+		flushcommit(@{$branchinfo->{$branch}->{commit}});
+	}
+}
+closeall();
+
+exit;
+
+
+BEGIN {
+	my %outputhandlers;
+	my $lastbranch = '';
+	my $prefix = '';
+
+	sub init_output {
+		if (exists($opts{d})) {
+			unless (-d $opts{d}) {
+				mkdir $opts{d} or die "mkdir: $opts{d}: $!\n";
+			}
+			$prefix = $opts{d} . '/';
+		} else {
+			$prefix = "";
+		}
+
+		open(my $output, ">", "${prefix}commit.jslog") or die "open: ${prefix}commit.jslog: $!\n";
+		$outputhandlers{"__ALLBRANCH__"} = $output;
+	}
+
+	sub output {
+		my ($branch, $line) = @_;
+
+		unless (exists($outputhandlers{$branch})) {
+			(my $_branch = $branch) =~ s,/,_,sg;
+			open(my $output, ">", "${prefix}commit.$_branch.jslog") or die "open: ${prefix}commit.$_branch.jslog: $!\n";
+			$outputhandlers{$branch} = $output;
+		}
+		my $output = $outputhandlers{$branch};
+		print $output $line;
+		$output = $outputhandlers{"__ALLBRANCH__"};
+		print $output $line;
+
+		if ($lastbranch ne $branch) {
+			print STDERR "[$branch]";
+		}
+		print STDERR ".";
+		$lastbranch = $branch;
+	}
+
+	sub closeall {
+		for (values(%outputhandlers)) {
+			close($_);
+		}
+		print STDERR "\n";
+	}
+
+	sub flushcommit {
+		my @objs = @_;
+
+		return if ($#objs < 0);
+
+#		print "======== commit =========\n";
+		my $commitobj;
+
+		my $log = $objs[0]->{log};
+		my $author = $objs[0]->{author};
+		my $unixtime_start = $objs[0]->{unixtime};
+		my $unixtime = $objs[-1]->{unixtime};
+		my $branch = $objs[0]->{branch};
+
+		for (@objs) {
+#print Dumper($_);
+			delete $_->{log};
+			delete $_->{author};
+			delete $_->{branch};
+		}
+
+		$commitobj->{log} = $log;
+		$commitobj->{author} = $author;
+		$commitobj->{unixtime_start} = $unixtime_start;
+		$commitobj->{unixtime} = $unixtime;
+		$commitobj->{branch} = $branch;
+
+		@{$commitobj->{files}} = @objs;
+
+		output($branch, encode_json($commitobj) . "\n");
+#		print Dumper($commitobj);
+	}
+}

@@ -1,0 +1,10 @@
+cvsroot-*
+cvstmp
+gitwork
+logs
+work.import
+work.increment
+rsync.log
+git.log
+GITTIME
+SYNC_COMMIT
