@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/usr/local/bin/perl
 
 use strict;
 use warnings;
@@ -36,7 +36,21 @@ my @list1 = sort(files($dir1));
 my @list2 = sort(files($dir2));
 
 if ($#list1 != $#list2) {
-	print "number of file different $dir1/ and $dir2/\n";
+	open(TMP, ">", "/tmp/compare_dir.1.$$");
+	for (@list1) {
+		s,^[^/]+/,,;
+		print TMP $_, "\n";
+	}
+	close(TMP);
+	open(TMP, ">", "/tmp/compare_dir.2.$$");
+	for (@list2) {
+		s,^[^/]+/,,;
+		print TMP $_, "\n";
+	}
+	close(TMP);
+	system("diff -au /tmp/compare_dir.1.$$ /tmp/compare_dir.2.$$");
+
+	print "number of file different $dir1/ ($#list1) and $dir2/ ($#list2)\n";
 	exit 1;
 }
 
