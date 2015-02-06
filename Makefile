@@ -104,6 +104,9 @@ compare-dir-hack:
 git-checkout-master:
 	cd ${GITDIR} && git checkout master && git clean -f
 
+push:
+	./PUSH
+
 # detect cvs repository has renamed/modified manually
 copy-from-cvs-to-git-and-commit:
 	cd ${GITDIR} && git checkout master && git clean -f

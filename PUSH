@@ -1,0 +1,4 @@
+#!/bin/sh
+
+cd gitwork &&
+git push git@github.com:IIJ-NetBSD/netbsd-src.git
