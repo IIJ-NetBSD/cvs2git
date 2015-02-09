@@ -164,7 +164,7 @@ sub git_modify {
 	print $file $body;
 	close($file);
 
-	system('git', 'add', $obj->{path});
+	system('git', 'add', '-f', $obj->{path});
 }
 
 sub git_append {
@@ -186,7 +186,7 @@ sub git_append {
 	chmod $mode, $file;
 	close($file);
 
-	system('git', 'add', $obj->{path});
+	system('git', 'add', '-f', $obj->{path});
 }
 
 sub cvs_get {
